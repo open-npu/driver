@@ -38,12 +38,28 @@ typedef void    *TaskHandle_t;
 #define pdMS_TO_TICKS(x) ((TickType_t)(x))
 #define portMAX_DELAY    0xFFFFFFFFU
 #define eSetValueWithOverwrite 0
+#define tskIDLE_PRIORITY 0
+#define configMINIMAL_STACK_SIZE 128
+#define taskENTER_CRITICAL() ((void)0)
+#define taskEXIT_CRITICAL()  ((void)0)
 
 static inline SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (SemaphoreHandle_t)1; }
 static inline BaseType_t xSemaphoreTake(SemaphoreHandle_t s, TickType_t t) { (void)s; (void)t; return pdPASS; }
 static inline BaseType_t xSemaphoreGive(SemaphoreHandle_t s) { (void)s; return pdPASS; }
 static inline void vSemaphoreDelete(SemaphoreHandle_t s) { (void)s; }
 static inline TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (TaskHandle_t)1; }
+static inline BaseType_t xTaskCreate(void (*fn)(void *), const char *name,
+                                     uint32_t stack, void *arg, uint32_t prio,
+                                     TaskHandle_t *task)
+{
+    (void)fn; (void)name; (void)stack; (void)arg; (void)prio;
+    if (task)
+        *task = (TaskHandle_t)2;
+    return pdPASS;
+}
+static inline void vTaskDelete(TaskHandle_t task) { (void)task; }
+static inline BaseType_t xTaskNotify(TaskHandle_t t, uint32_t v, int a)
+    { (void)t; (void)v; (void)a; return pdPASS; }
 static inline BaseType_t xTaskNotifyFromISR(TaskHandle_t t, uint32_t v, int a, BaseType_t *w)
     { (void)t; (void)v; (void)a; *w = pdFALSE; return pdPASS; }
 static inline BaseType_t xTaskNotifyWait(uint32_t b, uint32_t c, uint32_t *v, TickType_t t)
@@ -103,6 +119,7 @@ npu_status_t npu_rtos_init(const npu_rtos_config_t *config);
 /*
  * Deinitialize FreeRTOS NPU driver.
  * Disables IRQ, deletes mutex, resets state.
+ * Call only after every asynchronous request has completed.
  */
 void npu_rtos_deinit(void);
 
@@ -120,9 +137,9 @@ npu_status_t npu_rtos_run_model(const void *model_bin,
                                 uint32_t timeout_ms);
 
 /*
- * Submit model for async execution (non-blocking).
- * Takes mutex, starts inference, returns immediately.
- * Caller must call npu_rtos_wait() to wait for completion and release mutex.
+ * Submit model to a driver worker task (non-blocking).
+ * The worker owns the hardware mutex and starts inference independently.
+ * Only one asynchronous request can be active at a time.
  *
  * req: must remain valid until npu_rtos_wait() returns.
  * Returns: NPU_OK on successful submission.
@@ -131,8 +148,8 @@ npu_status_t npu_rtos_run_model_async(npu_inference_req_t *req);
 
 /*
  * Wait for async inference to complete.
- * Blocks until all layers finish or timeout.
- * Releases the hardware mutex upon return.
+ * Blocks until all layers finish or timeout. A wait timeout does not cancel
+ * the worker; the request must remain valid and may be waited on again.
  *
  * timeout_ms: total timeout in milliseconds (0 = infinite).
  * Returns: NPU_OK, NPU_ERR_TIMEOUT, NPU_ERR_HW_ERROR.
