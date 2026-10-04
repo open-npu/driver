@@ -93,8 +93,8 @@ typedef struct {
     int16_t  clamp_max;      /* 51 */
     int8_t   in_zp;          /* 53 */
 
-    /* Offset 54: padding */
-    uint8_t  _pad1;          /* 54 */
+    /* Offset 54: weight blob layout */
+    uint8_t  wgt_layout;     /* 54: 0=OC-major, 1=K-major */
 
     /* Offset 55-56: param channel count */
     uint16_t param_ch_count; /* 55 */

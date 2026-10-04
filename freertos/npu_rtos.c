@@ -15,6 +15,7 @@ static TaskHandle_t       s_caller_task;    /* task waiting for completion */
 static volatile uint32_t  s_irq_result;     /* IRQ status from ISR        */
 static volatile uint8_t   s_initialized;
 static uint32_t           s_default_timeout_ms;
+static npu_inference_req_t *s_async_req;
 
 /* ═══════════════════════════════════════════════════════════════════
  *  ISR callback — registered with baremetal npu_set_done_callback()
@@ -74,10 +75,13 @@ static uint32_t rtos_layer_weight_size(const npu_layer_desc_t *d)
  * Caller must already hold s_hw_mutex and have set s_caller_task.
  */
 static npu_status_t rtos_run_layers(const void *model_bin,
+                                    uint32_t ext_mem_base,
                                     uint32_t io_buf_base,
                                     uint32_t timeout_ms)
 {
     const uint8_t *base = (const uint8_t *)model_bin;
+    if (model_bin == NULL || ext_mem_base == 0)
+        return NPU_ERR_BAD_MODEL;
     const npu_model_header_t *hdr = (const npu_model_header_t *)base;
 
     if (hdr->magic != NPU_MODEL_MAGIC)
@@ -102,9 +106,21 @@ static npu_status_t rtos_run_layers(const void *model_bin,
     for (uint32_t i = 0; i < num_layers; i++) {
         const npu_layer_desc_t *d = (const npu_layer_desc_t *)desc_ptr;
 
+        if (d->wgt_layout > 1 || d->sched_ctrl != 0 ||
+            d->tile_h != 0 || d->tile_w != 0 ||
+            d->has_lut || d->input_src != -1 ||
+            d->residual_src >= 0 ||
+            d->op_type == NPU_OP_ELTWISE_ADD ||
+            d->op_type == NPU_OP_CONCAT)
+            return NPU_ERR_BAD_MODEL;
+
         uint32_t bpe      = (d->data_type == NPU_DTYPE_INT16) ? 2 : 1;
-        uint32_t in_size  = (uint32_t)d->in_h  * d->in_w  * d->in_c  * bpe;
-        uint32_t out_size = (uint32_t)d->out_h * d->out_w * d->out_c * bpe;
+        uint64_t in_size64 = (uint64_t)d->in_h * d->in_w * d->in_c * bpe;
+        uint64_t out_size64 = (uint64_t)d->out_h * d->out_w * d->out_c * bpe;
+        if (in_size64 > UINT32_MAX || out_size64 > UINT32_MAX)
+            return NPU_ERR_BAD_MODEL;
+        uint32_t in_size  = (uint32_t)in_size64;
+        uint32_t out_size = (uint32_t)out_size64;
         uint32_t wgt_size = rtos_layer_weight_size(d);
 
         cur_out = use_a ? buf_a : buf_b;
@@ -112,7 +128,8 @@ static npu_status_t rtos_run_layers(const void *model_bin,
         /* Param address */
         uint32_t param_addr = 0;
         if (d->param_ch_count > 0)
-            param_addr = (uint32_t)(uintptr_t)(desc_ptr + NPU_FIXED_CONFIG_SIZE);
+            param_addr = ext_mem_base
+                       + (uint32_t)(desc_ptr + NPU_FIXED_CONFIG_SIZE - base);
 
         /* SRAM out_base */
         uint32_t n_in_words = in_size / 4;
@@ -125,16 +142,12 @@ static npu_status_t rtos_run_layers(const void *model_bin,
         npu_status_t st;
         st = npu_program_layer(d,
                                cur_in, cur_out,
-                               (uint32_t)(uintptr_t)wgt_ptr,
+                               ext_mem_base + (uint32_t)(wgt_ptr - base),
                                param_addr,
                                in_size, wgt_size, out_size,
                                n_in_words);
         if (st != NPU_OK)
             return st;
-
-        /* Add-specific second input */
-        if (d->op_type == NPU_OP_ELTWISE_ADD && d->residual_src >= 0)
-            npu_reg_write(NPU_REG_DMA_ADD_B_ADDR, cur_in);
 
         /* Start HW */
         st = npu_start();
@@ -162,6 +175,34 @@ static npu_status_t rtos_run_layers(const void *model_bin,
     return NPU_OK;
 }
 
+/*
+ * Async execution owns the hardware mutex in one task from start to finish.
+ * FreeRTOS mutexes cannot legally be taken by the submitter and released by
+ * another task, so npu_rtos_wait() only waits for this worker's notification.
+ */
+static void rtos_async_worker(void *arg)
+{
+    npu_inference_req_t *req = (npu_inference_req_t *)arg;
+    npu_status_t result = NPU_ERR_BUSY;
+
+    if (xSemaphoreTake(s_hw_mutex, portMAX_DELAY) == pdPASS) {
+        s_caller_task = xTaskGetCurrentTaskHandle();
+        result = rtos_run_layers(req->model_bin, req->ext_mem_base,
+                                 req->io_buf_base, s_default_timeout_ms);
+        req->cycles = npu_get_cycle_count();
+        s_caller_task = NULL;
+        xSemaphoreGive(s_hw_mutex);
+    }
+
+    req->result = result;
+    req->_done = 1;
+    taskENTER_CRITICAL();
+    s_async_req = NULL;
+    taskEXIT_CRITICAL();
+    xTaskNotify(req->_caller_task, 1u, eSetValueWithOverwrite);
+    vTaskDelete(NULL);
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Public API
  * ═══════════════════════════════════════════════════════════════════ */
@@ -181,6 +222,7 @@ npu_status_t npu_rtos_init(const npu_rtos_config_t *config)
 
     /* Register ISR callback */
     s_caller_task = NULL;
+    s_async_req = NULL;
     s_irq_result  = 0;
     npu_set_done_callback(rtos_irq_callback, NULL);
 
@@ -197,6 +239,9 @@ npu_status_t npu_rtos_init(const npu_rtos_config_t *config)
 void npu_rtos_deinit(void)
 {
     if (!s_initialized)
+        return;
+    /* Never delete a mutex or callback while the worker still owns them. */
+    if (s_async_req != NULL)
         return;
 
     /* Disable IRQs and clear callback */
@@ -218,8 +263,6 @@ npu_status_t npu_rtos_run_model(const void *model_bin,
                                 uint32_t io_buf_base,
                                 uint32_t timeout_ms)
 {
-    (void)ext_mem_base;
-
     if (!s_initialized)
         return NPU_ERR_BUSY;
 
@@ -234,7 +277,8 @@ npu_status_t npu_rtos_run_model(const void *model_bin,
     uint32_t tmo = timeout_ms > 0 ? timeout_ms : s_default_timeout_ms;
 
     /* Run all layers */
-    npu_status_t result = rtos_run_layers(model_bin, io_buf_base, tmo);
+    npu_status_t result = rtos_run_layers(model_bin, ext_mem_base,
+                                          io_buf_base, tmo);
 
     /* Cleanup */
     s_caller_task = NULL;
@@ -245,12 +289,16 @@ npu_status_t npu_rtos_run_model(const void *model_bin,
 
 npu_status_t npu_rtos_run_model_async(npu_inference_req_t *req)
 {
-    if (!s_initialized || req == NULL)
+    if (!s_initialized || req == NULL || req->model_bin == NULL ||
+        req->ext_mem_base == 0)
         return NPU_ERR_BUSY;
 
-    /* Acquire hardware lock */
-    if (xSemaphoreTake(s_hw_mutex, portMAX_DELAY) != pdPASS)
-        return NPU_ERR_BUSY;
+    const npu_model_header_t *hdr = (const npu_model_header_t *)req->model_bin;
+    if (hdr->magic != NPU_MODEL_MAGIC)
+        return NPU_ERR_BAD_MODEL;
+
+    /* Remove a stale notification before the worker signals completion. */
+    xTaskNotifyWait(0xFFFFFFFFu, 0xFFFFFFFFu, NULL, 0);
 
     /* Set up request state */
     req->_caller_task = xTaskGetCurrentTaskHandle();
@@ -259,53 +307,50 @@ npu_status_t npu_rtos_run_model_async(npu_inference_req_t *req)
     req->result       = NPU_OK;
     req->cycles       = 0;
 
-    /* Register caller for notification */
-    s_caller_task = req->_caller_task;
-
-    /* Validate model header before starting */
-    const npu_model_header_t *hdr = (const npu_model_header_t *)req->model_bin;
-    if (hdr->magic != NPU_MODEL_MAGIC) {
-        s_caller_task = NULL;
-        xSemaphoreGive(s_hw_mutex);
-        req->result = NPU_ERR_BAD_MODEL;
-        req->_done  = 1;
-        return NPU_ERR_BAD_MODEL;
+    taskENTER_CRITICAL();
+    if (s_async_req != NULL) {
+        taskEXIT_CRITICAL();
+        req->_submitted = 0;
+        return NPU_ERR_BUSY;
     }
+    s_async_req       = req;
+    taskEXIT_CRITICAL();
 
-    /*
-     * For async, we start the full model execution in the current task context.
-     * The actual async behavior comes from the caller being free to do other
-     * work between submission and npu_rtos_wait(). Since the NPU is layer-
-     * sequential, we run layers inside rtos_wait() rather than here.
-     *
-     * This design keeps the mutex held during the entire inference to prevent
-     * concurrent hardware access. The calling task yields CPU during each
-     * layer's xTaskNotifyWait().
-     */
+    TaskHandle_t worker = NULL;
+    BaseType_t created = xTaskCreate(
+        rtos_async_worker, "npu_async",
+        (uint32_t)configMINIMAL_STACK_SIZE * 4u, req,
+        (uint32_t)tskIDLE_PRIORITY + 1u, &worker);
+    if (created != pdPASS) {
+        taskENTER_CRITICAL();
+        s_async_req = NULL;
+        taskEXIT_CRITICAL();
+        req->_submitted = 0;
+        req->_done = 1;
+        req->result = NPU_ERR_HW_ERROR;
+        return NPU_ERR_HW_ERROR;
+    }
 
     return NPU_OK;
 }
 
 npu_status_t npu_rtos_wait(npu_inference_req_t *req, uint32_t timeout_ms)
 {
-    if (req == NULL || !req->_submitted || req->_done)
+    if (req == NULL || !req->_submitted)
+        return NPU_ERR_BUSY;
+    if (req->_caller_task != xTaskGetCurrentTaskHandle())
         return NPU_ERR_BUSY;
 
-    /* Run all layers (this will yield CPU during each layer wait) */
-    npu_status_t result = rtos_run_layers(req->model_bin,
-                                          req->io_buf_base,
-                                          timeout_ms);
+    if (!req->_done) {
+        TickType_t ticks = timeout_ms > 0
+                         ? pdMS_TO_TICKS(timeout_ms) : portMAX_DELAY;
+        uint32_t notification;
+        if (xTaskNotifyWait(0, 0xFFFFFFFFu, &notification, ticks) != pdPASS)
+            return NPU_ERR_TIMEOUT;
+        (void)notification;
+    }
 
-    /* Record results */
-    req->result = result;
-    req->cycles = npu_get_cycle_count();
-    req->_done  = 1;
-
-    /* Release hardware */
-    s_caller_task = NULL;
-    xSemaphoreGive(s_hw_mutex);
-
-    return result;
+    return req->result;
 }
 
 /* ── Passthrough functions (no mutex needed for read-only queries) ── */

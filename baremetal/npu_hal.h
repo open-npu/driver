@@ -75,7 +75,7 @@ static inline uint32_t npu_reg_read(uint32_t offset) {
 #define HW_CFG_ARRAY_SIZE(v)   ((v) & 0xFF)
 #define HW_CFG_NUM_ARRAYS(v)   (((v) >> 8) & 0x0F)
 #define HW_CFG_DW_CH_LOG2(v)   (((v) >> 12) & 0x0F)
-#define HW_CFG_SPAD_4KB(v)     (((v) >> 16) & 0xFF)
+#define HW_CFG_SPAD_KB(v)      (((v) >> 16) & 0xFF)
 #define HW_CFG_HAS_INT16(v)    (((v) >> 24) & 1)
 #define HW_CFG_HAS_LUT(v)      (((v) >> 25) & 1)
 #define HW_CFG_HAS_IPU(v)      (((v) >> 26) & 1)
@@ -105,10 +105,12 @@ static inline uint32_t npu_reg_read(uint32_t offset) {
 #define NPU_REG_SRAM_BASE       0x078
 
 /* LAYER_MODE field packing */
-#define LAYER_MODE(op, dtype)  ((uint32_t)(op) | ((uint32_t)(dtype) << 4))
+#define LAYER_MODE(op, dtype, in_zp) \
+    ((uint32_t)(op) | ((uint32_t)(dtype) << 4) | \
+     (((uint32_t)(uint16_t)(int16_t)(in_zp)) << 8))
 
-/* Dimension packing (H in [15:0], W in [31:16]) */
-#define DIM_HW(h, w)   (((uint32_t)(h) & 0xFFFF) | (((uint32_t)(w) & 0xFFFF) << 16))
+/* Dimension packing: RTL decodes W from [15:0], H from [31:16]. */
+#define DIM_HW(h, w)   (((uint32_t)(w) & 0xFFFF) | (((uint32_t)(h) & 0xFFFF) << 16))
 
 /* Kernel packing: [7:0]=KH, [15:8]=KW, [23:16]=DH, [31:24]=DW */
 #define KERNEL_PACK(kh, kw, dh, dw)  \
@@ -118,10 +120,9 @@ static inline uint32_t npu_reg_read(uint32_t offset) {
 /* Stride packing: [7:0]=SH, [15:8]=SW */
 #define STRIDE_PACK(sh, sw)  ((uint32_t)(sh) | ((uint32_t)(sw) << 8))
 
-/* Padding packing: [7:0]=top, [15:8]=bottom, [23:16]=left, [31:24]=right */
+/* RTL derives bottom/right from output dimensions; CSR stores top and left. */
 #define PADDING_PACK(top, bot, left, right)  \
-    ((uint32_t)(top) | ((uint32_t)(bot) << 8) | \
-     ((uint32_t)(left) << 16) | ((uint32_t)(right) << 24))
+    ((uint32_t)(top) | ((uint32_t)(left) << 8))
 
 /* SRAM_BASE packing: [12:0]=act_base, [28:16]=out_base */
 #define SRAM_BASE_PACK(act, out)  \
@@ -164,6 +165,13 @@ static inline uint32_t npu_reg_read(uint32_t offset) {
 #define NPU_REG_DMA_IN_SIZE         0x128
 #define NPU_REG_DMA_WGT_SIZE        0x12C
 #define NPU_REG_DMA_OUT_SIZE        0x130
+#define NPU_REG_DMA_TILE_IN_SIZE    0x134
+#define NPU_REG_DMA_TILE_OUT_SIZE   0x138
+#define NPU_REG_DMA_TILE_IN_HW      0x13C
+#define NPU_REG_DMA_STORE_MODE      0x140
+#define NPU_REG_DMA_ROW_CFG         0x144
+#define NPU_REG_DMA_WGT_PER_OC      0x148
+#define NPU_REG_WGT_LAYOUT          0x14C
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Group 3: Post-processing (0x180 - 0x1FF)
@@ -190,9 +198,9 @@ static inline uint32_t npu_reg_read(uint32_t offset) {
 #define POST_BIAS_EN         (1U << 6)
 #define POST_INT16_OUT       (1U << 7)
 
-/* POST_CLAMP packing: [15:0]=min (signed), [31:16]=max (signed) */
+/* Current RTL consumes clamp_max from [15:0]; clamp_min is dtype-defined. */
 #define POST_CLAMP_PACK(min_val, max_val)  \
-    (((uint32_t)(uint16_t)(min_val)) | (((uint32_t)(uint16_t)(max_val)) << 16))
+    ((uint32_t)(uint16_t)(max_val))
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Group 4: LUT Data (0x200 - 0x3FF)

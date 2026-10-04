@@ -9,6 +9,13 @@
 
 #include "npu_driver.h"
 
+typedef char npu_layer_desc_size_must_be_62[
+    sizeof(npu_layer_desc_t) == NPU_FIXED_CONFIG_SIZE ? 1 : -1
+];
+typedef char npu_wgt_layout_offset_must_be_54[
+    offsetof(npu_layer_desc_t, wgt_layout) == 54 ? 1 : -1
+];
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Static state for IRQ callback
  * ═══════════════════════════════════════════════════════════════════ */
@@ -56,7 +63,7 @@ void npu_get_hw_config(npu_hw_config_t *cfg)
     cfg->array_size  = (uint8_t)HW_CFG_ARRAY_SIZE(v);
     cfg->num_arrays  = (uint8_t)HW_CFG_NUM_ARRAYS(v);
     cfg->dw_channels = (uint8_t)(1U << HW_CFG_DW_CH_LOG2(v));
-    cfg->spad_size_kb = (uint16_t)(HW_CFG_SPAD_4KB(v) * 4);
+    cfg->spad_size_kb = (uint16_t)HW_CFG_SPAD_KB(v);
     cfg->has_int16   = (uint8_t)HW_CFG_HAS_INT16(v);
     cfg->has_lut     = (uint8_t)HW_CFG_HAS_LUT(v);
     cfg->has_ipu     = (uint8_t)HW_CFG_HAS_IPU(v);
@@ -83,7 +90,7 @@ npu_status_t npu_program_layer(const npu_layer_desc_t *d,
     /* ── Group 1: Layer parameters ── */
 
     npu_reg_write(NPU_REG_LAYER_MODE,
-                  LAYER_MODE(d->op_type, d->data_type));
+                  LAYER_MODE(d->op_type, d->data_type, d->in_zp));
 
     npu_reg_write(NPU_REG_IN_DIM_HW,  DIM_HW(d->in_h, d->in_w));
     npu_reg_write(NPU_REG_IN_DIM_C,   d->in_c);
@@ -146,7 +153,14 @@ npu_status_t npu_program_layer(const npu_layer_desc_t *d,
     npu_reg_write(NPU_REG_DMA_WGT_SIZE,  dma_wgt_size);
     npu_reg_write(NPU_REG_DMA_OUT_SIZE,  dma_out_size);
 
-    npu_reg_write(NPU_REG_DMA_CTRL, 0);  /* no transpose, default burst */
+    npu_reg_write(NPU_REG_DMA_CTRL, d->sched_ctrl);
+    npu_reg_write(NPU_REG_DMA_TILE_IN_SIZE, 0);
+    npu_reg_write(NPU_REG_DMA_TILE_OUT_SIZE, 0);
+    npu_reg_write(NPU_REG_DMA_WGT_PER_OC, 0);
+    npu_reg_write(NPU_REG_DMA_STORE_MODE, 0);
+    npu_reg_write(NPU_REG_DMA_ROW_CFG, 0);
+    npu_reg_write(NPU_REG_DMA_TILE_IN_HW, 0);
+    npu_reg_write(NPU_REG_WGT_LAYOUT, d->wgt_layout);
 
     /* ── Group 3: Post-processing ── */
     npu_reg_write(NPU_REG_POST_CTRL, d->post_ctrl);
@@ -161,6 +175,8 @@ npu_status_t npu_start(void)
 {
     if (npu_reg_read(NPU_REG_STATUS) & STATUS_BUSY)
         return NPU_ERR_BUSY;
+    npu_reg_write(NPU_REG_IRQ_STATUS,
+                  IRQ_DONE_EN | IRQ_ERROR_EN | IRQ_DMA_DONE_EN);
     npu_reg_write(NPU_REG_CTRL, CTRL_START);
     return NPU_OK;
 }
@@ -168,11 +184,15 @@ npu_status_t npu_start(void)
 npu_status_t npu_wait_done_poll(uint32_t timeout_cycles)
 {
     for (uint32_t i = 0; i < timeout_cycles; i++) {
-        uint32_t st = npu_reg_read(NPU_REG_STATUS);
-        if (st & STATUS_ERROR)
+        uint32_t irq = npu_reg_read(NPU_REG_IRQ_STATUS);
+        if (irq & IRQ_ERROR_EN) {
+            npu_reg_write(NPU_REG_IRQ_STATUS, irq);
             return NPU_ERR_HW_ERROR;
-        if (st & STATUS_DONE)
+        }
+        if (irq & IRQ_DONE_EN) {
+            npu_reg_write(NPU_REG_IRQ_STATUS, irq);
             return NPU_OK;
+        }
     }
     return NPU_ERR_TIMEOUT;
 }
@@ -291,8 +311,12 @@ npu_status_t npu_run_model(const void *model_bin,
                            uint32_t ext_mem_base,
                            uint32_t io_buf_base)
 {
-    (void)ext_mem_base;  /* reserved for future use (e.g., absolute address remapping) */
     const uint8_t *base = (const uint8_t *)model_bin;
+
+    /* The DMA sees the model at ext_mem_base; model_bin is the CPU mapping of
+     * those same bytes and is used only for parsing descriptors. */
+    if (model_bin == NULL || ext_mem_base == 0)
+        return NPU_ERR_BAD_MODEL;
 
     /* Validate header */
     const npu_model_header_t *hdr = (const npu_model_header_t *)base;
@@ -325,10 +349,25 @@ npu_status_t npu_run_model(const void *model_bin,
         /* The fixed config is directly castable (packed struct) */
         const npu_layer_desc_t *d = (const npu_layer_desc_t *)desc_ptr;
 
+        /* NPU1 does not carry the extra DMA geometry needed by the current
+         * tiled/DB/fused hardware path. Refuse those models instead of
+         * silently programming an incomplete sequence. */
+        if (d->wgt_layout > 1 || d->sched_ctrl != 0 ||
+            d->tile_h != 0 || d->tile_w != 0 ||
+            d->has_lut || d->input_src != -1 ||
+            d->residual_src >= 0 ||
+            d->op_type == NPU_OP_ELTWISE_ADD ||
+            d->op_type == NPU_OP_CONCAT)
+            return NPU_ERR_BAD_MODEL;
+
         /* Compute sizes */
         uint32_t bpe = (d->data_type == NPU_DTYPE_INT16) ? 2 : 1;
-        uint32_t in_size  = (uint32_t)d->in_h  * d->in_w  * d->in_c  * bpe;
-        uint32_t out_size = (uint32_t)d->out_h * d->out_w * d->out_c * bpe;
+        uint64_t in_size64 = (uint64_t)d->in_h * d->in_w * d->in_c * bpe;
+        uint64_t out_size64 = (uint64_t)d->out_h * d->out_w * d->out_c * bpe;
+        if (in_size64 > UINT32_MAX || out_size64 > UINT32_MAX)
+            return NPU_ERR_BAD_MODEL;
+        uint32_t in_size  = (uint32_t)in_size64;
+        uint32_t out_size = (uint32_t)out_size64;
         uint32_t wgt_size = layer_weight_size(d);
 
         /* Output buffer */
@@ -337,7 +376,8 @@ npu_status_t npu_run_model(const void *model_bin,
         /* Param address (per-channel params follow fixed config in binary) */
         uint32_t param_addr = 0;
         if (d->param_ch_count > 0)
-            param_addr = (uint32_t)(uintptr_t)(desc_ptr + NPU_FIXED_CONFIG_SIZE);
+            param_addr = ext_mem_base
+                       + (uint32_t)(desc_ptr + NPU_FIXED_CONFIG_SIZE - base);
 
         /* SRAM out_base: simple heuristic — place output after input */
         uint32_t n_in_words = in_size / 4;
@@ -348,7 +388,7 @@ npu_status_t npu_run_model(const void *model_bin,
         st = npu_program_layer(d,
                                cur_in,              /* ddr_in_addr */
                                cur_out,             /* ddr_out_addr */
-                               (uint32_t)(uintptr_t)wgt_ptr, /* ddr_wgt_addr */
+                               ext_mem_base + (uint32_t)(wgt_ptr - base),
                                param_addr,          /* ddr_param_addr */
                                in_size,             /* dma_in_size */
                                wgt_size,            /* dma_wgt_size */
@@ -356,13 +396,6 @@ npu_status_t npu_run_model(const void *model_bin,
                                n_in_words);         /* sram_out_base */
         if (st != NPU_OK)
             return st;
-
-        /* Add-specific: program second input address */
-        if (d->op_type == NPU_OP_ELTWISE_ADD && d->residual_src >= 0) {
-            /* For simple sequential models, residual is not handled.
-             * In production, track layer output addresses for residual routing. */
-            npu_reg_write(NPU_REG_DMA_ADD_B_ADDR, cur_in);
-        }
 
         /* Start and wait */
         st = npu_start();
