@@ -121,8 +121,8 @@ typedef struct {
  *  Hardware info (returned by npu_get_hw_config)
  * ═══════════════════════════════════════════════════════════════════ */
 typedef struct {
-    uint8_t  array_size;     /* systolic array N (16/32/64) */
-    uint8_t  num_arrays;     /* number of arrays */
+    uint8_t  array_size;     /* dense MAC lanes; field name retained for ABI */
+    uint8_t  num_arrays;     /* number of MAC rows; field name retained for ABI */
     uint8_t  dw_channels;    /* DW conv parallel channels = 2^dw_ch_log2 */
     uint16_t spad_size_kb;   /* scratchpad total KB */
     uint8_t  has_int16;
