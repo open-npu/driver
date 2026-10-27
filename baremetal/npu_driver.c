@@ -83,9 +83,26 @@ npu_status_t npu_program_layer(const npu_layer_desc_t *d,
                                uint32_t dma_out_size,
                                uint32_t sram_out_base)
 {
+    uint32_t wgt_per_group = 0;
+
     /* Check NPU is not busy */
     if (npu_reg_read(NPU_REG_STATUS) & STATUS_BUSY)
         return NPU_ERR_BUSY;
+
+    if (d->wgt_layout == 1 &&
+        (d->op_type == NPU_OP_CONV2D || d->op_type == NPU_OP_FC) &&
+        dma_wgt_size > 80U * 1024U) {
+        uint32_t bpe = (d->data_type == NPU_DTYPE_INT16) ? 2U : 1U;
+        uint32_t k_bytes = (uint32_t)d->kernel_h * d->kernel_w
+                         * d->in_c * bpe;
+        uint32_t group_ch;
+        for (group_ch = 64U; group_ch > 1U; group_ch >>= 1)
+            if (group_ch * k_bytes <= 80U * 1024U)
+                break;
+        if (group_ch * k_bytes > 80U * 1024U)
+            return NPU_ERR_BAD_MODEL;
+        wgt_per_group = (group_ch * k_bytes + 3U) / 4U;
+    }
 
     /* ── Group 1: Layer parameters ── */
 
@@ -156,7 +173,7 @@ npu_status_t npu_program_layer(const npu_layer_desc_t *d,
     npu_reg_write(NPU_REG_DMA_CTRL, d->sched_ctrl);
     npu_reg_write(NPU_REG_DMA_TILE_IN_SIZE, 0);
     npu_reg_write(NPU_REG_DMA_TILE_OUT_SIZE, 0);
-    npu_reg_write(NPU_REG_DMA_WGT_PER_OC, 0);
+    npu_reg_write(NPU_REG_DMA_WGT_PER_OC, wgt_per_group);
     npu_reg_write(NPU_REG_DMA_STORE_MODE, 0);
     npu_reg_write(NPU_REG_DMA_ROW_CFG, 0);
     npu_reg_write(NPU_REG_DMA_TILE_IN_HW, 0);
