@@ -37,8 +37,11 @@ npu_init();                        // Software reset + clear IRQs
 
 npu_version_t ver = npu_get_version();
 npu_hw_config_t cfg;
-npu_get_hw_config(&cfg);           // Read array_size, spad_size_kb, etc.
+npu_get_hw_config(&cfg);           // Read MAC lanes, DW lanes, SPAD size, etc.
 ```
+
+For ABI compatibility, `cfg.array_size` reports the dense MAC lane count and
+`cfg.num_arrays` reports the number of MAC rows.
 
 ### Single-layer Execution (Polling)
 
